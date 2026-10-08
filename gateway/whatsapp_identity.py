@@ -8,12 +8,14 @@ plugins should use :func:`canonical_whatsapp_identifier` to line up with Hermes'
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
-from typing import Set
+from pathlib import Path
+from typing import List, Set
 
-from hermes_constants import get_hermes_dir
+from hermes_constants import get_default_hermes_root, get_hermes_dir
 
 logger = logging.getLogger(__name__)
 
@@ -66,13 +68,36 @@ def normalize_whatsapp_mention_jid(value: str) -> str:
     )
 
 
+def _lid_mapping_dirs() -> List[Path]:
+    """Session dirs that may hold the bridge's ``lid-mapping-*.json`` files, nearest first.
+
+    The bridge writes those files wherever its own session lives, which is not necessarily the
+    active profile's home: under the multiplex fold the WhatsApp bridge is shared ingress owned by
+    the **default** profile, so a secondary profile in ``<root>/profiles/<name>`` would otherwise
+    look only in ``<profile>/platforms/whatsapp/session`` (never created) and fail to resolve every
+    LID — denying an allowlisted phone number with a pairing prompt. See #135139.
+
+    Deliberately uncached: the active home changes inside one process under multiplex (per-profile
+    runtime scopes), so a construction-time snapshot would drift.
+    """
+    dirs = [get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")]
+    with contextlib.suppress(Exception):
+        # Same helper, host/default home — honours the legacy layout there too.
+        host_dir = get_hermes_dir(
+            "platforms/whatsapp/session", "whatsapp/session", home=get_default_hermes_root()
+        )
+        if host_dir != dirs[0]:
+            dirs.append(host_dir)
+    return dirs
+
+
 def expand_whatsapp_aliases(identifier: str) -> Set[str]:
     """All identifiers transitively reachable via the bridge's ``lid-mapping-*.json`` files;
     always includes the normalized input itself (empty set if it normalizes to empty)."""
     normalized = normalize_whatsapp_identifier(identifier)
     if not normalized:
         return set()
-    session_dir = get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
+    session_dirs = _lid_mapping_dirs()
     resolved: Set[str] = set()
     queue = [normalized]
     while queue:
@@ -83,8 +108,14 @@ def expand_whatsapp_aliases(identifier: str) -> Set[str]:
             continue
         resolved.add(current)
         for suffix in ("", "_reverse"):
-            mapping_path = session_dir / f"lid-mapping-{current}{suffix}.json"
-            if not mapping_path.exists():
+            # Nearest dir wins for a given name: the owning profile's own session is authoritative.
+            mapping_path = None
+            for candidate_dir in session_dirs:
+                candidate = candidate_dir / f"lid-mapping-{current}{suffix}.json"
+                if candidate.exists():
+                    mapping_path = candidate
+                    break
+            if mapping_path is None:
                 continue
             try:
                 # utf-8-sig: our fix for BOM'd lid-mapping files written on Windows.
